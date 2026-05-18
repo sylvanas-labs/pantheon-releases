@@ -1,0 +1,127 @@
+name: Refresh Release Channel
+
+on:
+  repository_dispatch:
+    types:
+      - refresh-channel-release
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: Versioned release tag to mirror into the rolling channel
+        required: true
+        type: string
+      channel:
+        description: Channel to refresh, or auto to infer from the source tag
+        required: false
+        default: auto
+        type: choice
+        options:
+          - auto
+          - alpha
+          - beta
+          - stable
+
+permissions:
+  contents: write
+
+concurrency:
+  group: refresh-release-channel-${{ github.event.client_payload.channel || github.event.inputs.channel || github.event.client_payload.source_tag || github.event.inputs.source_tag }}
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SOURCE_TAG: ${{ github.event.client_payload.source_tag || github.event.inputs.source_tag }}
+      REQUESTED_CHANNEL: ${{ github.event.client_payload.channel || github.event.inputs.channel || 'auto' }}
+    steps:
+      - name: Refresh rolling release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          repo="${GITHUB_REPOSITORY}"
+          source_tag="${SOURCE_TAG}"
+          requested_channel="${REQUESTED_CHANNEL:-auto}"
+
+          if [[ -z "$source_tag" ]]; then
+            echo "source_tag is required"
+            exit 1
+          fi
+
+          if [[ "$source_tag" =~ ^(alpha|beta|stable)-latest$ ]]; then
+            echo "Skipping rolling channel tag: $source_tag"
+            exit 0
+          fi
+
+          if [[ "$requested_channel" == "auto" || -z "$requested_channel" ]]; then
+            if [[ "$source_tag" =~ [Aa]lpha ]]; then
+              channel="alpha"
+            elif [[ "$source_tag" =~ [Bb]eta ]]; then
+              channel="beta"
+            else
+              channel="stable"
+            fi
+          else
+            channel="$requested_channel"
+          fi
+
+          case "$channel" in
+            alpha|beta|stable) ;;
+            *)
+              echo "Unsupported channel: $channel"
+              exit 1
+              ;;
+          esac
+
+          work_dir="$(mktemp -d)"
+          trap 'rm -rf "$work_dir"' EXIT
+          notes_file="$work_dir/release-notes.md"
+          assets_dir="$work_dir/assets"
+          mkdir -p "$assets_dir"
+
+          release_json="$work_dir/source-release.json"
+          gh api "repos/$repo/releases/tags/$source_tag" > "$release_json"
+
+          title="$(jq -r '.name // .tag_name' "$release_json")"
+          jq -r '.body // ""' "$release_json" > "$notes_file"
+          if [[ ! -s "$notes_file" ]]; then
+            printf 'Channel mirror of `%s` release `%s`.\n' "$repo" "$source_tag" > "$notes_file"
+          fi
+
+          gh release download "$source_tag" --repo "$repo" --dir "$assets_dir" --clobber
+          mapfile -d '' assets < <(find "$assets_dir" -type f -print0 | sort -z)
+          if [[ "${#assets[@]}" -eq 0 ]]; then
+            echo "Source release $source_tag has no assets; refusing to publish an empty channel release."
+            exit 1
+          fi
+
+          ref_json="$work_dir/source-ref.json"
+          gh api "repos/$repo/git/ref/tags/$source_tag" > "$ref_json"
+          ref_type="$(jq -r '.object.type' "$ref_json")"
+          target_sha="$(jq -r '.object.sha' "$ref_json")"
+          if [[ "$ref_type" == "tag" ]]; then
+            tag_json="$work_dir/source-tag.json"
+            gh api "repos/$repo/git/tags/$target_sha" > "$tag_json"
+            target_sha="$(jq -r '.object.sha' "$tag_json")"
+          fi
+
+          channel_tag="${channel}-latest"
+          gh release delete "$channel_tag" --repo "$repo" --cleanup-tag --yes >/dev/null 2>&1 || true
+
+          args=(
+            release create "$channel_tag"
+            --repo "$repo"
+            --target "$target_sha"
+            --title "$title"
+            --notes-file "$notes_file"
+          )
+
+          if [[ "$channel" == "stable" ]]; then
+            args+=(--latest)
+          else
+            args+=(--prerelease --latest=false)
+          fi
+
+          gh "${args[@]}" "${assets[@]}"
